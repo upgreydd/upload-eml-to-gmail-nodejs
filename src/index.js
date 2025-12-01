@@ -1,8 +1,12 @@
+// Load environment variables from .env file
+require('dotenv').config();
+
 const imap = require("imap");
 const { simpleParser } = require("mailparser");
 const fs = require("fs-extra");
 const path = require("path");
 const winston = require("winston");
+const xoauth2 = require("xoauth2");
 const { config } = require("./config");
 
 // Set up logging
@@ -24,24 +28,68 @@ const logger = winston.createLogger({
 
 // IMAP connection
 function connectToImap() {
-  return new Promise((resolve, reject) => {
-    const imapClient = new imap(config.imap);
-    imapClient.once("ready", () => {
-      imapClient.openBox(config.gmailLabel, false, (err) => {
-        if (err) {
-          logger.error(`Failed to open mailbox: ${err.message}`);
-          return reject(err);
-        }
-        logger.info("Connected to IMAP server");
-        resolve(imapClient);
-      });
-    });
-    imapClient.once("error", (err) => {
-      logger.error(`IMAP connection error: ${err.message}`);
+  return new Promise(async (resolve, reject) => {
+    try {
+      // Prepare IMAP configuration
+      let imapConfig = { ...config.imap };
+
+      // Check if xoauth2 is configured
+      if (config.xoauth2 && config.xoauth2.clientId && config.xoauth2.clientSecret && config.xoauth2.refreshToken) {
+        logger.info("Using xoauth2 authentication");
+
+        // Create xoauth2 generator
+        const xoauth2gen = xoauth2.createXOAuth2Generator({
+          user: config.imap.user,
+          clientId: config.xoauth2.clientId,
+          clientSecret: config.xoauth2.clientSecret,
+          refreshToken: config.xoauth2.refreshToken,
+          accessToken: config.xoauth2.accessToken || undefined
+        });
+
+        // Get token
+        xoauth2gen.getToken((err, token) => {
+          if (err) {
+            logger.error(`Failed to get xoauth2 token: ${err.message}`);
+            logger.error('Make sure your OAuth2 credentials are correct. See XOAUTH2_SETUP.md for help.');
+            return reject(err);
+          }
+
+          // Configure IMAP with xoauth2
+          imapConfig.xoauth2 = token;
+          delete imapConfig.password; // Remove password when using xoauth2
+
+          logger.info("xoauth2 token obtained successfully");
+          createImapConnection(imapConfig, resolve, reject);
+        });
+      } else {
+        logger.info("Using password authentication");
+        createImapConnection(imapConfig, resolve, reject);
+      }
+    } catch (err) {
+      logger.error(`Error preparing IMAP connection: ${err.message}`);
       reject(err);
-    });
-    imapClient.connect();
+    }
   });
+}
+
+// Helper function to create IMAP connection
+function createImapConnection(imapConfig, resolve, reject) {
+  const imapClient = new imap(imapConfig);
+  imapClient.once("ready", () => {
+    imapClient.openBox(config.gmailLabel, false, (err) => {
+      if (err) {
+        logger.error(`Failed to open mailbox: ${err.message}`);
+        return reject(err);
+      }
+      logger.info("Connected to IMAP server");
+      resolve(imapClient);
+    });
+  });
+  imapClient.once("error", (err) => {
+    logger.error(`IMAP connection error: ${err.message}`);
+    reject(err);
+  });
+  imapClient.connect();
 }
 
 // Load processed files
@@ -123,7 +171,7 @@ async function main() {
 
     // Periodic keep-alive
     keepAlive = setInterval(() => {
-      imapClient.search(["ALL"], () => {}); // NOOP equivalent
+      imapClient.search(["ALL"], () => { }); // NOOP equivalent
       logger.info(`Keep-alive`);
     }, 1000 * 30); // Every 30 seconds
 
