@@ -80,6 +80,7 @@ This Node.js application imports `.eml` email files into a specified Gmail label
 **Method 1: OAuth2 (Recommended)**
 - More secure, no passwords stored
 - Follows modern authentication standards
+- Uses secure localhost redirect (replaces deprecated out-of-band flow)
 - See detailed setup in [XOAUTH2_SETUP.md](XOAUTH2_SETUP.md)
 
 **Method 2: App-Specific Password**
@@ -98,7 +99,11 @@ This Node.js application imports `.eml` email files into a specified Gmail label
 
 1. **Generate OAuth2 Token** (if using OAuth2):
    ```bash
+   # Automatic token generation (local/SSH tunnel)
    npm run generate-oauth2-token
+
+   # Or manual process (remote servers)
+   npm run generate-auth-url
    ```
 
 2. **Verify Configuration** (recommended):
@@ -157,6 +162,7 @@ This Node.js application imports `.eml` email files into a specified Gmail label
   - `invalid_client`: Check Client ID and Client Secret
   - `invalid_grant`: Refresh token may be expired, generate a new one
   - `insufficient_scope`: Ensure proper Gmail API scopes (see XOAUTH2_SETUP.md)
+  - `access blocked` or `redirect_uri_mismatch`: Add `http://localhost:3000/callback` to OAuth 2.0 Client redirect URIs in Google Cloud Console
 - **Label Not Found**:
   - Ensure the `GMAIL_LABEL` exists in Gmail (case-sensitive).
 - **File Not Found**:

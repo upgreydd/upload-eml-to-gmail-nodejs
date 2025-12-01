@@ -25,7 +25,12 @@ This document describes how to configure xoauth2 (OAuth2) for secure Gmail conne
 2. Click "Create Credentials" > "OAuth 2.0 Client IDs"
 3. Select "Desktop application" as application type
 4. Give it a name (e.g., "Gmail EML Importer")
-5. Download the JSON credentials file
+5. **Add Authorized redirect URIs**:
+   - **For local development**: `http://localhost:3000/callback`
+   - **For remote server**: `https://your-domain.com:3000/callback` (replace with your actual domain)
+6. Download the JSON credentials file
+
+**Note**: The redirect URI is required because Google deprecated the out-of-band (OOB) flow for security reasons.
 
 ### 3. Obtaining Refresh Token
 
@@ -60,12 +65,44 @@ This project includes a helper script that automates the token generation proces
    ```
 
 3. Follow the prompts:
-   - The script will display a URL - open it in your browser
+   - The script will start a local server on port 3000
+   - Open the displayed URL in your browser
    - Sign in to Gmail and authorize the application
-   - Copy the authorization code and paste it when prompted
+   - The authorization will be handled automatically (no need to copy/paste codes)
    - The script will automatically update your `.env` file with the tokens
 
-This method is easier and automatically saves the tokens to your `.env` file.
+This method is fully automated and uses the secure localhost redirect flow (replacing the deprecated out-of-band flow).
+
+#### Option C: Remote Server Configuration
+
+If you're running this on a remote server (VPS, cloud instance, etc.), you have several options:
+
+**Method 1: SSH Tunnel (Easiest)**
+```bash
+# On your local machine, create SSH tunnel
+ssh -L 3000:localhost:3000 user@your-remote-server
+
+# Then run the OAuth2 generator on the remote server
+npm run generate-oauth2-token
+```
+
+**Method 2: Public Domain Configuration**
+1. Set up your redirect URI in `.env`:
+   ```env
+   OAUTH2_REDIRECT_URI=https://your-domain.com:3000/callback
+   OAUTH2_SERVER_PORT=3000
+   ```
+2. Make sure your server is accessible on that domain/port
+3. Add the same URI to Google Cloud Console OAuth2 credentials
+4. Run the generator:
+   ```bash
+   npm run generate-oauth2-token
+   ```
+
+**Method 3: Generate Locally, Transfer Tokens**
+1. Run OAuth2 generation on your local machine
+2. Copy the tokens from your local `.env` file
+3. Transfer them to your remote server's `.env` file
 
 ### 4. Application Configuration
 
@@ -106,6 +143,15 @@ When xoauth2 is configured, the application automatically:
 - Check if xoauth2 token is properly generated
 - Check application logs for error details
 
+### "Access blocked" or "redirect_uri_mismatch" Error
+- Make sure you've added `http://localhost:3000/callback` to your OAuth 2.0 Client's "Authorized redirect URIs" in Google Cloud Console
+- The redirect URI must match exactly (including the port number)
+- This error occurs because Google deprecated the out-of-band (OOB) flow
+
+### "Port 3000 is already in use" Error
+- Stop any other applications using port 3000 (you can check with `lsof -i :3000` on macOS/Linux)
+- Or temporarily change the port in the helper script if needed
+
 ## Useful Links
 
 - [Google OAuth2 Documentation](https://developers.google.com/identity/protocols/oauth2)
@@ -120,6 +166,9 @@ After configuring xoauth2, you can test the configuration:
 ```bash
 # Generate OAuth2 tokens (if using Option B)
 npm run generate-oauth2-token
+
+# Or just generate the authorization URL (for manual process)
+npm run generate-auth-url
 
 # Check configuration
 npm run check-config
