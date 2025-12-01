@@ -92,6 +92,34 @@ function createImapConnection(imapConfig, resolve, reject) {
   imapClient.connect();
 }
 
+// Recursively get all files from directory and subdirectories
+async function getFilesRecursively(dirPath) {
+  const allFiles = [];
+
+  try {
+    const items = await fs.readdir(dirPath);
+
+    for (const item of items) {
+      const fullPath = path.join(dirPath, item);
+      const stats = await fs.stat(fullPath);
+
+      if (stats.isDirectory()) {
+        // Recursively scan subdirectory
+        const subFiles = await getFilesRecursively(fullPath);
+        allFiles.push(...subFiles);
+      } else if (stats.isFile()) {
+        // Add file path relative to the base directory
+        const relativePath = path.relative(config.emlDir, fullPath);
+        allFiles.push(relativePath);
+      }
+    }
+  } catch (err) {
+    logger.error(`Error reading directory ${dirPath}: ${err.message}`);
+  }
+
+  return allFiles;
+}
+
 // Load processed files
 async function getProcessedFiles() {
   try {
@@ -179,35 +207,35 @@ async function main() {
     logger.info("Reading processed files...");
     const processedFiles = await getProcessedFiles();
 
-    // Load list of files
-    logger.info("Reading directory...");
-    const allFiles = await fs.readdir(config.emlDir);
+    // Load list of files recursively
+    logger.info("Reading directory recursively...");
+    const allFiles = await getFilesRecursively(config.emlDir);
 
     // Filter .eml files
     logger.info("Filtering .eml files...");
-    const emlFiles = allFiles.filter((filename) =>
-      filename.toLowerCase().endsWith(".eml")
+    const emlFiles = allFiles.filter((filePath) =>
+      filePath.toLowerCase().endsWith(".eml")
     );
 
     // Filter not yet processed files
     logger.info("Filtering processed files...");
-    const files = emlFiles.filter((filename) => !processedFiles.has(filename));
+    const files = emlFiles.filter((filePath) => !processedFiles.has(filePath));
 
     logger.info(
       `Found ${allFiles.length} file(s), ${emlFiles.length} .eml file(s), ${files.length} file(s) not yet processed`
     );
 
     // Process .eml files
-    for (const filename of files) {
+    for (const filePath of files) {
       totalFiles++;
 
-      logger.info(`Processing ${totalFiles}/${files.length} file: ${filename}`);
+      logger.info(`Processing ${totalFiles}/${files.length} file: ${filePath}`);
 
-      const emlPath = path.join(config.emlDir, filename);
+      const emlPath = path.join(config.emlDir, filePath);
       const success = await uploadEml(
         imapClient,
         emlPath,
-        filename,
+        filePath,
         processedFiles
       );
       if (success) {
