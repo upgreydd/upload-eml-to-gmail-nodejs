@@ -1,7 +1,7 @@
 module.exports.config = {
   imap: {
-    user: process.env.GMAIL_USER || "yourname@gmail.com", // Replace with your Gmail address
-    password: process.env.GMAIL_PASSWORD || "your-app-specific-password", // Replace with App-Specific Password (not needed for xoauth2)
+    user: process.env.GMAIL_USER || undefined, // Replace with your Gmail address
+    password: process.env.GMAIL_PASSWORD || undefined, // Replace with App-Specific Password (not needed for xoauth2)
     host: "imap.gmail.com",
     port: 993,
     tls: true,
