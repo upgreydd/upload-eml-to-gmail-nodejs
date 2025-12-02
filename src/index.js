@@ -10,8 +10,8 @@ const xoauth2 = require("xoauth2");
 const { config } = require("./config");
 
 // Configuration for concurrent processing
-const WORKER_POOL_SIZE = process.env.WORKER_POOL_SIZE || 3; // Number of concurrent IMAP connections
-const BATCH_SIZE = process.env.BATCH_SIZE || 10; // Files per worker batch
+const WORKER_POOL_SIZE = process.env.WORKER_POOL_SIZE || 2; // Number of concurrent IMAP connections (reduced for Gmail stability)
+const BATCH_SIZE = process.env.BATCH_SIZE || 5; // Files per worker batch (reduced for Gmail stability)
 
 // Global file lock to prevent duplicate processing
 const processingFiles = new Set();
@@ -396,43 +396,46 @@ async function processFilesConcurrently(files) {
           try {
             logger.debug(`Worker ${worker.workerId}: Processing ${filePath}`);
 
-            const success = await worker.processFile(filePath); if (success) {
-              batchResults.success++;
-            } else {
-              batchResults.failure++;
-            }
+            const success = await worker.processFile(filePath);
 
-            // Record progress in thread-safe way
-            await progressTracker.recordResult(success, filePath);
-
-          } catch (err) {
-            logger.error(`Worker ${worker.workerId}: Failed to process ${filePath} - ${err.message}`);
+            // Add small delay to reduce Gmail API pressure
+            await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay if (success) {
+            batchResults.success++;
+          } else {
             batchResults.failure++;
-            await progressTracker.recordResult(false, filePath);
           }
+
+          // Record progress in thread-safe way
+          await progressTracker.recordResult(success, filePath);
+
+        } catch (err) {
+          logger.error(`Worker ${worker.workerId}: Failed to process ${filePath} - ${err.message}`);
+          batchResults.failure++;
+          await progressTracker.recordResult(false, filePath);
         }
+      }
 
         logger.info(`Worker ${worker.workerId}: Batch completed - ${batchResults.success} success, ${batchResults.failure} failed`);
-        return batchResults;
-      })();
+      return batchResults;
+    }) ();
 
-      workerPromises.push(promise);
-    }    // Wait for all workers to complete
+    workerPromises.push(promise);
+  }    // Wait for all workers to complete
     const batchResults = await Promise.all(workerPromises);
 
-    const finalResults = progressTracker.getResults();
-    logger.info(`All workers completed. Total: ${finalResults.totalFiles}, Success: ${finalResults.successCount}, Failed: ${finalResults.failureCount}`);
+  const finalResults = progressTracker.getResults();
+  logger.info(`All workers completed. Total: ${finalResults.totalFiles}, Success: ${finalResults.successCount}, Failed: ${finalResults.failureCount}`);
 
-  } finally {
-    // Clear progress watchdog
-    clearInterval(progressWatchdog);
+} finally {
+  // Clear progress watchdog
+  clearInterval(progressWatchdog);
 
-    // Disconnect all workers
-    logger.info("Disconnecting workers...");
-    await Promise.all(workers.map(worker => worker.disconnect()));
-  }
+  // Disconnect all workers
+  logger.info("Disconnecting workers...");
+  await Promise.all(workers.map(worker => worker.disconnect()));
+}
 
-  return progressTracker.getResults();
+return progressTracker.getResults();
 }
 
 // Timeout wrapper for operations that might hang
@@ -472,7 +475,7 @@ async function uploadEml(imapClient, emlPath, filename) {
 
     const alreadyExists = await withTimeout(
       isEmailAlreadyImported(imapClient, messageId, subject, date),
-      30000, // 30 second timeout
+      120000, // 2 minute timeout for duplicate check
       `Duplicate check for ${filename}`
     );
 
@@ -510,7 +513,7 @@ async function uploadEml(imapClient, emlPath, filename) {
 
     return await withTimeout(
       uploadPromise,
-      60000, // 60 second timeout for upload
+      180000, // 3 minute timeout for upload
       `Upload of ${filename}`
     );
 
