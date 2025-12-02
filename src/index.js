@@ -96,7 +96,13 @@ function createImapConnection(imapConfig, resolve, reject, isRetry = false) {
     logger.error(`IMAP connection error: ${err.message}`);
 
     // If authentication failed and we're using OAuth2, try to refresh token
-    if (!isRetry && imapConfig.xoauth2 && (err.message.includes('authenticate') || err.message.includes('invalid_token') || err.message.includes('AUTHENTICATIONFAILED'))) {
+    if (!isRetry && imapConfig.xoauth2 && (
+      err.message.includes('authenticate') ||
+      err.message.includes('invalid_token') ||
+      err.message.includes('AUTHENTICATIONFAILED') ||
+      err.message.includes('Invalid credentials') ||
+      err.message.includes('Authentication failed')
+    )) {
       logger.info("Authentication failed, attempting to refresh OAuth2 token...");
       refreshTokenAndRetry(imapConfig, resolve, reject);
     } else {
@@ -449,7 +455,12 @@ async function uploadEml(imapClient, emlPath, filename) {
         },
         (err) => {
           if (err) {
-            logger.error(`Failed to upload ${filename}: ${err.message}`);
+            // Check if it's a temporary error that should be retried
+            if (err.message.includes('System Error') || err.message.includes('Temporary failure') || err.message.includes('UNAVAILABLE')) {
+              logger.warn(`Temporary upload failure for ${filename}: ${err.message} - will retry later`);
+            } else {
+              logger.error(`Failed to upload ${filename}: ${err.message}`);
+            }
             return resolve(false);
           }
           logger.debug(`Successfully uploaded ${filename}`);
