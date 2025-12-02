@@ -11,7 +11,7 @@ const { config } = require("./config");
 
 // Configuration for concurrent processing
 const WORKER_POOL_SIZE = process.env.WORKER_POOL_SIZE || 2; // Number of concurrent IMAP connections (reduced for Gmail stability)
-const BATCH_SIZE = process.env.BATCH_SIZE || 5; // Files per worker batch (reduced for Gmail stability)
+const BATCH_SIZE = process.env.BATCH_SIZE || 3; // Files per worker batch (reduced for memory efficiency)
 
 // Global file lock to prevent duplicate processing
 const processingFiles = new Set();
@@ -161,14 +161,28 @@ async function getFilesRecursively(dirPath) {
   return allFiles;
 }
 
-// Load processed files
+// Load processed files (streaming for memory efficiency)
 async function getProcessedFiles() {
+  const processedFiles = new Set();
+
   try {
     if (await fs.pathExists(config.processedFile)) {
-      const data = await fs.readFile(config.processedFile, "utf8");
-      return new Set(data.split("\n").filter(Boolean));
+      const readline = require('readline');
+      const fileStream = fs.createReadStream(config.processedFile);
+      const rl = readline.createInterface({
+        input: fileStream,
+        crlfDelay: Infinity
+      });
+
+      for await (const line of rl) {
+        if (line.trim()) {
+          processedFiles.add(line.trim());
+        }
+      }
     }
-    return new Set();
+
+    logger.info(`Loaded ${processedFiles.size} processed files from tracking file`);
+    return processedFiles;
   } catch (err) {
     logger.error(`Error reading processed files: ${err.message}`);
     return new Set();
@@ -542,25 +556,28 @@ async function main() {
     logger.info("Reading processed files...");
     const processedFiles = await getProcessedFiles();
 
-    // Load list of files recursively
+    // Load and filter files efficiently (streaming approach)
     logger.info("Reading directory recursively...");
     const allFiles = await getFilesRecursively(config.emlDir);
 
-    // Filter .eml files
-    logger.info("Filtering .eml files...");
-    const emlFiles = allFiles.filter((filePath) =>
-      filePath.toLowerCase().endsWith(".eml")
-    );
-
-    // Filter not yet processed files
-    logger.info("Filtering processed files...");
-    const unprocessedFiles = emlFiles.filter((filePath) => !processedFiles.has(filePath));
+    // Filter .eml files and unprocessed files in one pass to save memory
+    logger.info("Filtering .eml files and processed files...");
+    let emlFileCount = 0;
+    const files = allFiles.filter((filePath) => {
+      if (filePath.toLowerCase().endsWith(".eml")) {
+        emlFileCount++;
+        return !processedFiles.has(filePath);
+      }
+      return false;
+    });
 
     logger.info(
-      `Found ${allFiles.length} file(s), ${emlFiles.length} .eml file(s), ${unprocessedFiles.length} file(s) not yet processed`
+      `Found ${allFiles.length} file(s), ${emlFileCount} .eml file(s), ${files.length} file(s) not yet processed`
     );
 
-    const files = unprocessedFiles;
+    // Clear large arrays from memory
+    allFiles.length = 0;
+    processedFiles.clear();
 
     if (files.length === 0) {
       logger.info("No files to process.");
