@@ -491,11 +491,13 @@ async function main() {
 
     // Filter not yet processed files
     logger.info("Filtering processed files...");
-    const files = emlFiles.filter((filePath) => !processedFiles.has(filePath));
+    const unprocessedFiles = emlFiles.filter((filePath) => !processedFiles.has(filePath));
 
     logger.info(
-      `Found ${allFiles.length} file(s), ${emlFiles.length} .eml file(s), ${files.length} file(s) not yet processed`
+      `Found ${allFiles.length} file(s), ${emlFiles.length} .eml file(s), ${unprocessedFiles.length} file(s) not yet processed`
     );
+
+    const files = unprocessedFiles;
 
     if (files.length === 0) {
       logger.info("No files to process.");
