@@ -311,16 +311,16 @@ class ProgressTracker {
       this.processedCount++;
       if (success) {
         this.successCount++;
-        logger.info(`✓ Successfully processed: ${filePath}`);
+        logger.debug(`✓ Successfully processed: ${filePath}`);
       } else {
         this.failureCount++;
-        logger.info(`✗ Failed to process: ${filePath}`);
+        logger.warn(`✗ Failed to process: ${filePath}`);
       }
 
-      // Report progress every 5 files or on significant milestones
-      if (this.processedCount - this.lastReported >= 5 ||
+      // Report progress every 25 files or on significant milestones
+      if (this.processedCount - this.lastReported >= 25 ||
         this.processedCount === this.totalFiles ||
-        this.processedCount % 25 === 0) {
+        this.processedCount % 100 === 0) {
         logger.info(`📊 Progress: ${this.processedCount}/${this.totalFiles} files processed (${this.successCount} success, ${this.failureCount} failed)`);
         this.lastReported = this.processedCount;
       }
@@ -370,11 +370,9 @@ async function processFilesConcurrently(files) {
 
         for (const filePath of batch) {
           try {
-            logger.info(`Worker ${worker.workerId}: Processing ${filePath}`);
+            logger.debug(`Worker ${worker.workerId}: Processing ${filePath}`);
 
-            const success = await worker.processFile(filePath);
-
-            if (success) {
+            const success = await worker.processFile(filePath); if (success) {
               batchResults.success++;
             } else {
               batchResults.failure++;
@@ -416,7 +414,7 @@ async function uploadEml(imapClient, emlPath, filename) {
     // Double-check processed files first (fastest check)
     const currentProcessedFiles = await getProcessedFiles();
     if (currentProcessedFiles.has(filename)) {
-      logger.info(`File ${filename} already in processed list, skipping`);
+      logger.debug(`File ${filename} already in processed list, skipping`);
       return true;
     }
 
@@ -429,20 +427,20 @@ async function uploadEml(imapClient, emlPath, filename) {
     const date = new Date(dateStr);
 
     // Check for duplicates in Gmail
-    logger.info(`Checking Gmail for duplicates of ${filename}...`);
+    logger.debug(`Checking Gmail for duplicates of ${filename}...`);
     const messageId = parsed.headers.get("message-id");
     const subject = parsed.subject;
 
     const alreadyExists = await isEmailAlreadyImported(imapClient, messageId, subject, date);
     if (alreadyExists) {
-      logger.info(`Email ${filename} already exists in Gmail, skipping upload`);
+      logger.debug(`Email ${filename} already exists in Gmail, skipping upload`);
       await appendProcessedFile(filename);
       return true; // Mark as successful since it's already there
     }
 
     // Upload to Gmail
     return new Promise((resolve, reject) => {
-      logger.info(`Uploading ${filename} to Gmail...`);
+      logger.debug(`Uploading ${filename} to Gmail...`);
       imapClient.append(
         emlContent,
         {
@@ -454,7 +452,7 @@ async function uploadEml(imapClient, emlPath, filename) {
             logger.error(`Failed to upload ${filename}: ${err.message}`);
             return resolve(false);
           }
-          logger.info(`Successfully uploaded ${filename}`);
+          logger.debug(`Successfully uploaded ${filename}`);
           appendProcessedFile(filename);
           resolve(true);
         }
