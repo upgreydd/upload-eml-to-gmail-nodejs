@@ -9,6 +9,10 @@ const winston = require("winston");
 const xoauth2 = require("xoauth2");
 const { config } = require("./config");
 
+// Configuration for concurrent processing
+const WORKER_POOL_SIZE = process.env.WORKER_POOL_SIZE || 3; // Number of concurrent IMAP connections
+const BATCH_SIZE = process.env.BATCH_SIZE || 10; // Files per worker batch
+
 // Set up logging
 const logger = winston.createLogger({
   exitOnError: false,
@@ -72,8 +76,8 @@ function connectToImap() {
   });
 }
 
-// Helper function to create IMAP connection
-function createImapConnection(imapConfig, resolve, reject) {
+// Helper function to create IMAP connection with auto-retry for auth failures
+function createImapConnection(imapConfig, resolve, reject, isRetry = false) {
   const imapClient = new imap(imapConfig);
   imapClient.once("ready", () => {
     imapClient.openBox(config.gmailLabel, false, (err) => {
@@ -87,9 +91,37 @@ function createImapConnection(imapConfig, resolve, reject) {
   });
   imapClient.once("error", (err) => {
     logger.error(`IMAP connection error: ${err.message}`);
-    reject(err);
+
+    // If authentication failed and we're using OAuth2, try to refresh token
+    if (!isRetry && imapConfig.xoauth2 && (err.message.includes('authenticate') || err.message.includes('invalid_token') || err.message.includes('AUTHENTICATIONFAILED'))) {
+      logger.info("Authentication failed, attempting to refresh OAuth2 token...");
+      refreshTokenAndRetry(imapConfig, resolve, reject);
+    } else {
+      reject(err);
+    }
   });
   imapClient.connect();
+}
+
+// Refresh OAuth2 token and retry connection
+function refreshTokenAndRetry(originalConfig, resolve, reject) {
+  const xoauth2gen = xoauth2.createXOAuth2Generator({
+    user: config.imap.user,
+    clientId: config.xoauth2.clientId,
+    clientSecret: config.xoauth2.clientSecret,
+    refreshToken: config.xoauth2.refreshToken
+  });
+
+  xoauth2gen.getToken((err, token) => {
+    if (err) {
+      logger.error(`Failed to refresh OAuth2 token: ${err.message}`);
+      return reject(err);
+    }
+
+    logger.info("OAuth2 token refreshed successfully, retrying connection...");
+    const newConfig = { ...originalConfig, xoauth2: token };
+    createImapConnection(newConfig, resolve, reject, true); // Mark as retry
+  });
 }
 
 // Recursively get all files from directory and subdirectories
@@ -143,13 +175,178 @@ async function appendProcessedFile(filename) {
   }
 }
 
+// Check if email already exists in Gmail
+async function isEmailAlreadyImported(imapClient, messageId, subject, date) {
+  return new Promise((resolve, reject) => {
+    if (!messageId && !subject) {
+      return resolve(false); // Can't check without identifiers
+    }
+
+    let searchCriteria = [];
+
+    if (messageId) {
+      // Search by Message-ID header (most reliable)
+      searchCriteria = [['HEADER', 'MESSAGE-ID', messageId]];
+    } else if (subject && date) {
+      // Fallback: search by subject and date
+      const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD format
+      searchCriteria = [
+        ['HEADER', 'SUBJECT', subject],
+        ['ON', dateStr]
+      ];
+    } else {
+      return resolve(false);
+    }
+
+    imapClient.search(searchCriteria, (err, results) => {
+      if (err) {
+        logger.warn(`Error searching for duplicate: ${err.message}`);
+        return resolve(false); // Continue with upload on search error
+      }
+
+      const exists = results && results.length > 0;
+      if (exists) {
+        logger.info(`Email already exists (found ${results.length} match(es))`);
+      }
+      resolve(exists);
+    });
+  });
+}
+
+// Worker class for handling concurrent uploads
+class EmailWorker {
+  constructor(workerId) {
+    this.workerId = workerId;
+    this.imapClient = null;
+    this.keepAlive = null;
+    this.isConnected = false;
+  }
+
+  async connect() {
+    try {
+      logger.info(`Worker ${this.workerId}: Connecting to IMAP...`);
+      this.imapClient = await connectToImap();
+      this.isConnected = true;
+      
+      // Start keep-alive for this worker
+      this.keepAlive = setInterval(() => {
+        if (this.imapClient && this.isConnected) {
+          this.imapClient.search(["ALL"], () => {});
+        }
+      }, 45000); // Every 45 seconds
+      
+      logger.info(`Worker ${this.workerId}: Connected successfully`);
+    } catch (err) {
+      logger.error(`Worker ${this.workerId}: Connection failed - ${err.message}`);
+      throw err;
+    }
+  }
+
+  async processFile(filePath) {
+    if (!this.isConnected || !this.imapClient) {
+      throw new Error(`Worker ${this.workerId}: Not connected to IMAP`);
+    }
+
+    const emlPath = path.join(config.emlDir, filePath);
+    return await uploadEml(this.imapClient, emlPath, filePath);
+  }
+
+  async disconnect() {
+    if (this.keepAlive) {
+      clearInterval(this.keepAlive);
+      this.keepAlive = null;
+    }
+    
+    if (this.imapClient && this.isConnected) {
+      try {
+        this.imapClient.end();
+        logger.info(`Worker ${this.workerId}: Disconnected`);
+      } catch (err) {
+        logger.error(`Worker ${this.workerId}: Error disconnecting - ${err.message}`);
+      }
+    }
+    
+    this.isConnected = false;
+    this.imapClient = null;
+  }
+}
+
+// Process files concurrently using worker pool
+async function processFilesConcurrently(files) {
+  const workers = [];
+  const results = {
+    totalFiles: files.length,
+    successCount: 0,
+    failureCount: 0
+  };
+
+  try {
+    // Create worker pool
+    logger.info(`Creating ${WORKER_POOL_SIZE} workers...`);
+    for (let i = 0; i < WORKER_POOL_SIZE; i++) {
+      const worker = new EmailWorker(i + 1);
+      await worker.connect();
+      workers.push(worker);
+    }
+
+    // Split files into batches for workers
+    const batches = [];
+    for (let i = 0; i < files.length; i += BATCH_SIZE) {
+      batches.push(files.slice(i, i + BATCH_SIZE));
+    }
+
+    logger.info(`Processing ${files.length} files in ${batches.length} batches using ${workers.length} workers...`);
+
+    // Process batches concurrently
+    let processedCount = 0;
+    const workerPromises = batches.map(async (batch, batchIndex) => {
+      const worker = workers[batchIndex % workers.length];
+      
+      for (const filePath of batch) {
+        try {
+          logger.info(`Worker ${worker.workerId}: Processing ${processedCount + 1}/${files.length} - ${filePath}`);
+          
+          const success = await worker.processFile(filePath);
+          
+          if (success) {
+            results.successCount++;
+          } else {
+            results.failureCount++;
+          }
+          
+          processedCount++;
+          
+          if (processedCount % 10 === 0) {
+            logger.info(`Progress: ${processedCount}/${files.length} files processed (${results.successCount} success, ${results.failureCount} failed)`);
+          }
+          
+        } catch (err) {
+          logger.error(`Worker ${worker.workerId}: Failed to process ${filePath} - ${err.message}`);
+          results.failureCount++;
+          processedCount++;
+        }
+      }
+    });
+
+    // Wait for all workers to complete
+    await Promise.all(workerPromises);
+    
+    logger.info(`All workers completed. Total: ${results.totalFiles}, Success: ${results.successCount}, Failed: ${results.failureCount}`);
+    
+  } finally {
+    // Disconnect all workers
+    logger.info("Disconnecting workers...");
+    await Promise.all(workers.map(worker => worker.disconnect()));
+  }
+
+  return results;
+}
+
 // Upload .eml file
-async function uploadEml(imapClient, emlPath, filename, processedFiles) {
+async function uploadEml(imapClient, emlPath, filename) {
   try {
     // Read and parse .eml file
-    logger.info("Reading file...");
     const emlContent = await fs.readFile(emlPath);
-    logger.info("Parsing file...");
     const parsed = await simpleParser(emlContent);
 
     // Get Date header
@@ -158,6 +355,18 @@ async function uploadEml(imapClient, emlPath, filename, processedFiles) {
     const date = new Date(dateStr);
 
     logger.info(`Date is ${date}`);
+
+    // Check for duplicates
+    logger.info("Checking for duplicates...");
+    const messageId = parsed.headers.get("message-id");
+    const subject = parsed.subject;
+
+    const alreadyExists = await isEmailAlreadyImported(imapClient, messageId, subject, date);
+    if (alreadyExists) {
+      logger.info("Email already exists in Gmail, skipping upload");
+      await appendProcessedFile(filename);
+      return true; // Mark as successful since it's already there
+    }
 
     // Upload to Gmail
     return new Promise((resolve, reject) => {
@@ -194,15 +403,6 @@ async function main() {
   let keepAlive = null;
 
   try {
-    // Connect to IMAP
-    imapClient = await connectToImap();
-
-    // Periodic keep-alive
-    keepAlive = setInterval(() => {
-      imapClient.search(["ALL"], () => { }); // NOOP equivalent
-      logger.info(`Keep-alive`);
-    }, 1000 * 30); // Every 30 seconds
-
     // Load processed files
     logger.info("Reading processed files...");
     const processedFiles = await getProcessedFiles();
@@ -225,29 +425,17 @@ async function main() {
       `Found ${allFiles.length} file(s), ${emlFiles.length} .eml file(s), ${files.length} file(s) not yet processed`
     );
 
-    // Process .eml files
-    for (const filePath of files) {
-      totalFiles++;
-
-      logger.info(`Processing ${totalFiles}/${files.length} file: ${filePath}`);
-
-      const emlPath = path.join(config.emlDir, filePath);
-      const success = await uploadEml(
-        imapClient,
-        emlPath,
-        filePath,
-        processedFiles
-      );
-      if (success) {
-        successCount++;
-      } else {
-        failureCount++;
-      }
-
-      logger.info(
-        `Processed ${totalFiles}/${files.length} files: ${successCount} successes, ${failureCount} failures`
-      );
+    if (files.length === 0) {
+      logger.info("No files to process.");
+      return;
     }
+
+    // Process .eml files concurrently
+    const results = await processFilesConcurrently(files);
+    
+    totalFiles = results.totalFiles;
+    successCount = results.successCount;
+    failureCount = results.failureCount;
 
     logger.info(
       `Completed. Total files: ${totalFiles}, Successes: ${successCount}, Failures: ${failureCount}`
@@ -255,19 +443,9 @@ async function main() {
   } catch (err) {
     logger.error(`Script failed: ${err.message}`);
     throw err; // Re-throw to trigger retry
-  } finally {
-    // Cleanup keep-alive
-    clearInterval(keepAlive);
-
-    // Cleanup IMAP connection
-    if (imapClient) {
-      try {
-        imapClient.end();
-        logger.info("IMAP connection closed");
-      } catch (endErr) {
-        logger.error(`Error closing IMAP connection: ${endErr.message}`);
-      }
-    }
+  } catch (err) {
+    logger.error(`Script failed: ${err.message}`);
+    throw err; // Re-throw to trigger retry
   }
 }
 
