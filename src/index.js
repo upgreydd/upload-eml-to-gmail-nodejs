@@ -227,14 +227,14 @@ class EmailWorker {
       logger.info(`Worker ${this.workerId}: Connecting to IMAP...`);
       this.imapClient = await connectToImap();
       this.isConnected = true;
-      
+
       // Start keep-alive for this worker
       this.keepAlive = setInterval(() => {
         if (this.imapClient && this.isConnected) {
-          this.imapClient.search(["ALL"], () => {});
+          this.imapClient.search(["ALL"], () => { });
         }
       }, 45000); // Every 45 seconds
-      
+
       logger.info(`Worker ${this.workerId}: Connected successfully`);
     } catch (err) {
       logger.error(`Worker ${this.workerId}: Connection failed - ${err.message}`);
@@ -256,7 +256,7 @@ class EmailWorker {
       clearInterval(this.keepAlive);
       this.keepAlive = null;
     }
-    
+
     if (this.imapClient && this.isConnected) {
       try {
         this.imapClient.end();
@@ -265,7 +265,7 @@ class EmailWorker {
         logger.error(`Worker ${this.workerId}: Error disconnecting - ${err.message}`);
       }
     }
-    
+
     this.isConnected = false;
     this.imapClient = null;
   }
@@ -301,25 +301,25 @@ async function processFilesConcurrently(files) {
     let processedCount = 0;
     const workerPromises = batches.map(async (batch, batchIndex) => {
       const worker = workers[batchIndex % workers.length];
-      
+
       for (const filePath of batch) {
         try {
           logger.info(`Worker ${worker.workerId}: Processing ${processedCount + 1}/${files.length} - ${filePath}`);
-          
+
           const success = await worker.processFile(filePath);
-          
+
           if (success) {
             results.successCount++;
           } else {
             results.failureCount++;
           }
-          
+
           processedCount++;
-          
+
           if (processedCount % 10 === 0) {
             logger.info(`Progress: ${processedCount}/${files.length} files processed (${results.successCount} success, ${results.failureCount} failed)`);
           }
-          
+
         } catch (err) {
           logger.error(`Worker ${worker.workerId}: Failed to process ${filePath} - ${err.message}`);
           results.failureCount++;
@@ -330,9 +330,9 @@ async function processFilesConcurrently(files) {
 
     // Wait for all workers to complete
     await Promise.all(workerPromises);
-    
+
     logger.info(`All workers completed. Total: ${results.totalFiles}, Success: ${results.successCount}, Failed: ${results.failureCount}`);
-    
+
   } finally {
     // Disconnect all workers
     logger.info("Disconnecting workers...");
@@ -432,7 +432,7 @@ async function main() {
 
     // Process .eml files concurrently
     const results = await processFilesConcurrently(files);
-    
+
     totalFiles = results.totalFiles;
     successCount = results.successCount;
     failureCount = results.failureCount;
@@ -440,9 +440,6 @@ async function main() {
     logger.info(
       `Completed. Total files: ${totalFiles}, Successes: ${successCount}, Failures: ${failureCount}`
     );
-  } catch (err) {
-    logger.error(`Script failed: ${err.message}`);
-    throw err; // Re-throw to trigger retry
   } catch (err) {
     logger.error(`Script failed: ${err.message}`);
     throw err; // Re-throw to trigger retry
