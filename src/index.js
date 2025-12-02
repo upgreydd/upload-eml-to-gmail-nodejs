@@ -346,6 +346,24 @@ class ProgressTracker {
 async function processFilesConcurrently(files) {
   const workers = [];
   const progressTracker = new ProgressTracker(files.length);
+  let lastProgressTime = Date.now();
+  let lastProgressCount = 0;
+
+  // Watchdog to detect stalled processing
+  const progressWatchdog = setInterval(() => {
+    const currentTime = Date.now();
+    const timeSinceLastProgress = currentTime - lastProgressTime;
+
+    if (progressTracker.processedCount > lastProgressCount) {
+      // Progress detected, update tracking
+      lastProgressTime = currentTime;
+      lastProgressCount = progressTracker.processedCount;
+    } else if (timeSinceLastProgress > 300000) { // 5 minutes without progress
+      logger.warn(`⚠️ Processing appears stalled - no progress for ${Math.round(timeSinceLastProgress / 1000)}s`);
+      logger.info(`Last progress: ${progressTracker.processedCount}/${progressTracker.totalFiles} files processed`);
+      lastProgressTime = currentTime; // Reset to avoid spam
+    }
+  }, 60000); // Check every minute
 
   try {
     // Create worker pool
@@ -406,12 +424,27 @@ async function processFilesConcurrently(files) {
     logger.info(`All workers completed. Total: ${finalResults.totalFiles}, Success: ${finalResults.successCount}, Failed: ${finalResults.failureCount}`);
 
   } finally {
+    // Clear progress watchdog
+    clearInterval(progressWatchdog);
+
     // Disconnect all workers
     logger.info("Disconnecting workers...");
     await Promise.all(workers.map(worker => worker.disconnect()));
   }
 
   return progressTracker.getResults();
+}
+
+// Timeout wrapper for operations that might hang
+function withTimeout(promise, timeoutMs, operation) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => {
+        reject(new Error(`${operation} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    })
+  ]);
 }
 
 // Upload .eml file
@@ -432,20 +465,25 @@ async function uploadEml(imapClient, emlPath, filename) {
     const dateStr = parsed.headers.get("date");
     const date = new Date(dateStr);
 
-    // Check for duplicates in Gmail
+    // Check for duplicates in Gmail with timeout
     logger.debug(`Checking Gmail for duplicates of ${filename}...`);
     const messageId = parsed.headers.get("message-id");
     const subject = parsed.subject;
 
-    const alreadyExists = await isEmailAlreadyImported(imapClient, messageId, subject, date);
+    const alreadyExists = await withTimeout(
+      isEmailAlreadyImported(imapClient, messageId, subject, date),
+      30000, // 30 second timeout
+      `Duplicate check for ${filename}`
+    );
+
     if (alreadyExists) {
       logger.debug(`Email ${filename} already exists in Gmail, skipping upload`);
       await appendProcessedFile(filename);
       return true; // Mark as successful since it's already there
     }
 
-    // Upload to Gmail
-    return new Promise((resolve, reject) => {
+    // Upload to Gmail with timeout
+    const uploadPromise = new Promise((resolve, reject) => {
       logger.debug(`Uploading ${filename} to Gmail...`);
       imapClient.append(
         emlContent,
@@ -469,8 +507,19 @@ async function uploadEml(imapClient, emlPath, filename) {
         }
       );
     });
+
+    return await withTimeout(
+      uploadPromise,
+      60000, // 60 second timeout for upload
+      `Upload of ${filename}`
+    );
+
   } catch (err) {
-    logger.error(`Error uploading: ${err.message}`);
+    if (err.message.includes('timed out')) {
+      logger.warn(`Operation timeout for ${filename}: ${err.message}`);
+    } else {
+      logger.error(`Error uploading ${filename}: ${err.message}`);
+    }
     return false;
   }
 }
