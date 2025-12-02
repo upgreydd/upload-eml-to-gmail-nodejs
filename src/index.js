@@ -13,6 +13,9 @@ const { config } = require("./config");
 const WORKER_POOL_SIZE = process.env.WORKER_POOL_SIZE || 3; // Number of concurrent IMAP connections
 const BATCH_SIZE = process.env.BATCH_SIZE || 10; // Files per worker batch
 
+// Global file lock to prevent duplicate processing
+const processingFiles = new Set();
+
 // Set up logging
 const logger = winston.createLogger({
   exitOnError: false,
@@ -247,8 +250,23 @@ class EmailWorker {
       throw new Error(`Worker ${this.workerId}: Not connected to IMAP`);
     }
 
-    const emlPath = path.join(config.emlDir, filePath);
-    return await uploadEml(this.imapClient, emlPath, filePath);
+    // Check if file is already being processed by another worker
+    if (processingFiles.has(filePath)) {
+      logger.warn(`Worker ${this.workerId}: File ${filePath} already being processed by another worker, skipping`);
+      return true; // Skip but don't fail
+    }
+
+    // Lock the file for processing
+    processingFiles.add(filePath);
+
+    try {
+      const emlPath = path.join(config.emlDir, filePath);
+      const result = await uploadEml(this.imapClient, emlPath, filePath);
+      return result;
+    } finally {
+      // Always unlock the file when done
+      processingFiles.delete(filePath);
+    }
   }
 
   async disconnect() {
@@ -395,32 +413,36 @@ async function processFilesConcurrently(files) {
 // Upload .eml file
 async function uploadEml(imapClient, emlPath, filename) {
   try {
+    // Double-check processed files first (fastest check)
+    const currentProcessedFiles = await getProcessedFiles();
+    if (currentProcessedFiles.has(filename)) {
+      logger.info(`File ${filename} already in processed list, skipping`);
+      return true;
+    }
+
     // Read and parse .eml file
     const emlContent = await fs.readFile(emlPath);
     const parsed = await simpleParser(emlContent);
 
     // Get Date header
-    logger.info("Parsing date...");
     const dateStr = parsed.headers.get("date");
     const date = new Date(dateStr);
 
-    logger.info(`Date is ${date}`);
-
-    // Check for duplicates
-    logger.info("Checking for duplicates...");
+    // Check for duplicates in Gmail
+    logger.info(`Checking Gmail for duplicates of ${filename}...`);
     const messageId = parsed.headers.get("message-id");
     const subject = parsed.subject;
 
     const alreadyExists = await isEmailAlreadyImported(imapClient, messageId, subject, date);
     if (alreadyExists) {
-      logger.info("Email already exists in Gmail, skipping upload");
+      logger.info(`Email ${filename} already exists in Gmail, skipping upload`);
       await appendProcessedFile(filename);
       return true; // Mark as successful since it's already there
     }
 
     // Upload to Gmail
     return new Promise((resolve, reject) => {
-      logger.info("Uploading...");
+      logger.info(`Uploading ${filename} to Gmail...`);
       imapClient.append(
         emlContent,
         {
@@ -429,10 +451,10 @@ async function uploadEml(imapClient, emlPath, filename) {
         },
         (err) => {
           if (err) {
-            logger.error(`Failed to upload: ${err.message}`);
+            logger.error(`Failed to upload ${filename}: ${err.message}`);
             return resolve(false);
           }
-          logger.info(`Successfully uploaded`);
+          logger.info(`Successfully uploaded ${filename}`);
           appendProcessedFile(filename);
           resolve(true);
         }
