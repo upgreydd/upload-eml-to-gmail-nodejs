@@ -399,43 +399,45 @@ async function processFilesConcurrently(files) {
             const success = await worker.processFile(filePath);
 
             // Add small delay to reduce Gmail API pressure
-            await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay if (success) {
-            batchResults.success++;
-          } else {
+            await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay
+
+            if (success) {
+              batchResults.success++;
+            } else {
+              batchResults.failure++;
+            }
+
+            // Record progress in thread-safe way
+            await progressTracker.recordResult(success, filePath);
+
+          } catch (err) {
+            logger.error(`Worker ${worker.workerId}: Failed to process ${filePath} - ${err.message}`);
             batchResults.failure++;
+            await progressTracker.recordResult(false, filePath);
           }
-
-          // Record progress in thread-safe way
-          await progressTracker.recordResult(success, filePath);
-
-        } catch (err) {
-          logger.error(`Worker ${worker.workerId}: Failed to process ${filePath} - ${err.message}`);
-          batchResults.failure++;
-          await progressTracker.recordResult(false, filePath);
         }
-      }
 
         logger.info(`Worker ${worker.workerId}: Batch completed - ${batchResults.success} success, ${batchResults.failure} failed`);
-      return batchResults;
-    }) ();
+        return batchResults;
+      })();
 
-    workerPromises.push(promise);
-  }    // Wait for all workers to complete
+      workerPromises.push(promise);
+    }    // Wait for all workers to complete
     const batchResults = await Promise.all(workerPromises);
 
-  const finalResults = progressTracker.getResults();
-  logger.info(`All workers completed. Total: ${finalResults.totalFiles}, Success: ${finalResults.successCount}, Failed: ${finalResults.failureCount}`);
+    const finalResults = progressTracker.getResults();
+    logger.info(`All workers completed. Total: ${finalResults.totalFiles}, Success: ${finalResults.successCount}, Failed: ${finalResults.failureCount}`);
 
-} finally {
-  // Clear progress watchdog
-  clearInterval(progressWatchdog);
+  } finally {
+    // Clear progress watchdog
+    clearInterval(progressWatchdog);
 
-  // Disconnect all workers
-  logger.info("Disconnecting workers...");
-  await Promise.all(workers.map(worker => worker.disconnect()));
-}
+    // Disconnect all workers
+    logger.info("Disconnecting workers...");
+    await Promise.all(workers.map(worker => worker.disconnect()));
+  }
 
-return progressTracker.getResults();
+  return progressTracker.getResults();
 }
 
 // Timeout wrapper for operations that might hang
