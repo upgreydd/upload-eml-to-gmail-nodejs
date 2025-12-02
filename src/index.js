@@ -271,7 +271,7 @@ class EmailWorker {
   }
 }
 
-// Thread-safe progress tracker
+// Thread-safe progress tracker with mutex-like behavior
 class ProgressTracker {
   constructor(totalFiles) {
     this.totalFiles = totalFiles;
@@ -279,26 +279,37 @@ class ProgressTracker {
     this.successCount = 0;
     this.failureCount = 0;
     this.lastReported = 0;
+    this.processing = false;
   }
 
-  recordResult(success) {
-    this.processedCount++;
-    if (success) {
-      this.successCount++;
-    } else {
-      this.failureCount++;
+  async recordResult(success, filePath = '') {
+    // Simple mutex to prevent race conditions
+    while (this.processing) {
+      await new Promise(resolve => setTimeout(resolve, 1));
     }
+    this.processing = true;
 
-    // Report progress every 5 files or on significant milestones
-    if (this.processedCount - this.lastReported >= 5 ||
-      this.processedCount === this.totalFiles ||
-      this.processedCount % 25 === 0) {
-      logger.info(`Progress: ${this.processedCount}/${this.totalFiles} files processed (${this.successCount} success, ${this.failureCount} failed)`);
-      this.lastReported = this.processedCount;
+    try {
+      this.processedCount++;
+      if (success) {
+        this.successCount++;
+        logger.info(`✓ Successfully processed: ${filePath}`);
+      } else {
+        this.failureCount++;
+        logger.info(`✗ Failed to process: ${filePath}`);
+      }
+
+      // Report progress every 5 files or on significant milestones
+      if (this.processedCount - this.lastReported >= 5 ||
+        this.processedCount === this.totalFiles ||
+        this.processedCount % 25 === 0) {
+        logger.info(`📊 Progress: ${this.processedCount}/${this.totalFiles} files processed (${this.successCount} success, ${this.failureCount} failed)`);
+        this.lastReported = this.processedCount;
+      }
+    } finally {
+      this.processing = false;
     }
-  }
-
-  getResults() {
+  } getResults() {
     return {
       totalFiles: this.totalFiles,
       successCount: this.successCount,
@@ -329,38 +340,44 @@ async function processFilesConcurrently(files) {
 
     logger.info(`Processing ${files.length} files in ${batches.length} batches using ${workers.length} workers...`);
 
-    // Process batches concurrently
-    const workerPromises = batches.map(async (batch, batchIndex) => {
-      const worker = workers[batchIndex % workers.length];
-      const batchResults = { success: 0, failure: 0 };
+    // Process batches concurrently - each batch gets its own dedicated worker
+    const workerPromises = [];
 
-      for (const filePath of batch) {
-        try {
-          logger.info(`Worker ${worker.workerId}: Processing ${filePath}`);
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i];
+      const worker = workers[i % workers.length];
 
-          const success = await worker.processFile(filePath);
+      const promise = (async () => {
+        const batchResults = { success: 0, failure: 0 };
 
-          if (success) {
-            batchResults.success++;
-          } else {
+        for (const filePath of batch) {
+          try {
+            logger.info(`Worker ${worker.workerId}: Processing ${filePath}`);
+
+            const success = await worker.processFile(filePath);
+
+            if (success) {
+              batchResults.success++;
+            } else {
+              batchResults.failure++;
+            }
+
+            // Record progress in thread-safe way
+            await progressTracker.recordResult(success, filePath);
+
+          } catch (err) {
+            logger.error(`Worker ${worker.workerId}: Failed to process ${filePath} - ${err.message}`);
             batchResults.failure++;
+            await progressTracker.recordResult(false, filePath);
           }
-
-          // Record progress in thread-safe way
-          progressTracker.recordResult(success);
-
-        } catch (err) {
-          logger.error(`Worker ${worker.workerId}: Failed to process ${filePath} - ${err.message}`);
-          batchResults.failure++;
-          progressTracker.recordResult(false);
         }
-      }
 
-      logger.info(`Worker ${worker.workerId}: Batch completed - ${batchResults.success} success, ${batchResults.failure} failed`);
-      return batchResults;
-    });
+        logger.info(`Worker ${worker.workerId}: Batch completed - ${batchResults.success} success, ${batchResults.failure} failed`);
+        return batchResults;
+      })();
 
-    // Wait for all workers to complete
+      workerPromises.push(promise);
+    }    // Wait for all workers to complete
     const batchResults = await Promise.all(workerPromises);
 
     const finalResults = progressTracker.getResults();
