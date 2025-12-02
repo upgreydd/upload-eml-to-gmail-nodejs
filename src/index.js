@@ -543,49 +543,90 @@ async function uploadEml(imapClient, emlPath, filename) {
   }
 }
 
+// Process files in chunks to avoid memory overload
+async function processFilesInChunks(processedFiles, allEmlFiles) {
+  const CHUNK_SIZE = 100; // Process 100 files at a time
+  let totalProcessed = 0;
+  let totalSuccess = 0;
+  let totalFailures = 0;
+
+  for (let i = 0; i < allEmlFiles.length; i += CHUNK_SIZE) {
+    const chunk = allEmlFiles.slice(i, i + CHUNK_SIZE);
+
+    // Filter unprocessed files in this chunk
+    const unprocessedChunk = chunk.filter(filePath => !processedFiles.has(filePath));
+
+    if (unprocessedChunk.length === 0) {
+      logger.info(`Chunk ${Math.floor(i / CHUNK_SIZE) + 1}: All ${chunk.length} files already processed, skipping`);
+      continue;
+    }
+
+    logger.info(`Processing chunk ${Math.floor(i / CHUNK_SIZE) + 1}: ${unprocessedChunk.length} files (${i + 1} to ${Math.min(i + CHUNK_SIZE, allEmlFiles.length)} of ${allEmlFiles.length})`);
+
+    // Process this chunk
+    const chunkResults = await processFilesConcurrently(unprocessedChunk);
+
+    totalProcessed += chunkResults.totalFiles;
+    totalSuccess += chunkResults.successCount;
+    totalFailures += chunkResults.failureCount;
+
+    logger.info(`Chunk completed: ${chunkResults.successCount}/${chunkResults.totalFiles} successful. Overall: ${totalSuccess}/${totalProcessed} (${totalFailures} failed)`);
+
+    // Force garbage collection between chunks
+    if (global.gc) {
+      global.gc();
+    }
+  }
+
+  return {
+    totalFiles: totalProcessed,
+    successCount: totalSuccess,
+    failureCount: totalFailures
+  };
+}
+
 // Main function
 async function main() {
   let totalFiles = 0;
   let successCount = 0;
   let failureCount = 0;
-  let imapClient = null;
-  let keepAlive = null;
 
   try {
     // Load processed files
     logger.info("Reading processed files...");
     const processedFiles = await getProcessedFiles();
 
-    // Load and filter files efficiently (streaming approach)
+    // Get all EML files (but don't filter yet to save memory)
     logger.info("Reading directory recursively...");
     const allFiles = await getFilesRecursively(config.emlDir);
 
-    // Filter .eml files and unprocessed files in one pass to save memory
-    logger.info("Filtering .eml files and processed files...");
-    let emlFileCount = 0;
-    const files = allFiles.filter((filePath) => {
-      if (filePath.toLowerCase().endsWith(".eml")) {
-        emlFileCount++;
-        return !processedFiles.has(filePath);
+    // Filter to EML files only
+    logger.info("Filtering .eml files...");
+    const emlFiles = allFiles.filter(filePath => filePath.toLowerCase().endsWith(".eml"));
+
+    // Clear allFiles array immediately
+    allFiles.length = 0;
+
+    // Count unprocessed files without creating large arrays
+    const totalEmlFiles = emlFiles.length;
+    let unprocessedCount = 0;
+    for (const filePath of emlFiles) {
+      if (!processedFiles.has(filePath)) {
+        unprocessedCount++;
       }
-      return false;
-    });
+    }
 
     logger.info(
-      `Found ${allFiles.length} file(s), ${emlFileCount} .eml file(s), ${files.length} file(s) not yet processed`
+      `Found ${totalEmlFiles} .eml file(s), ${unprocessedCount} file(s) not yet processed`
     );
 
-    // Clear large arrays from memory
-    allFiles.length = 0;
-    processedFiles.clear();
-
-    if (files.length === 0) {
+    if (unprocessedCount === 0) {
       logger.info("No files to process.");
       return;
     }
 
-    // Process .eml files concurrently
-    const results = await processFilesConcurrently(files);
+    // Process files in memory-efficient chunks
+    const results = await processFilesInChunks(processedFiles, emlFiles);
 
     totalFiles = results.totalFiles;
     successCount = results.successCount;
@@ -598,9 +639,7 @@ async function main() {
     logger.error(`Script failed: ${err.message}`);
     throw err; // Re-throw to trigger retry
   }
-}
-
-// Retry wrapper
+}// Retry wrapper
 async function runWithRetry(maxRetries = 3, delayMs = 5000) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
