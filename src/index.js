@@ -271,14 +271,46 @@ class EmailWorker {
   }
 }
 
+// Thread-safe progress tracker
+class ProgressTracker {
+  constructor(totalFiles) {
+    this.totalFiles = totalFiles;
+    this.processedCount = 0;
+    this.successCount = 0;
+    this.failureCount = 0;
+    this.lastReported = 0;
+  }
+
+  recordResult(success) {
+    this.processedCount++;
+    if (success) {
+      this.successCount++;
+    } else {
+      this.failureCount++;
+    }
+
+    // Report progress every 5 files or on significant milestones
+    if (this.processedCount - this.lastReported >= 5 ||
+      this.processedCount === this.totalFiles ||
+      this.processedCount % 25 === 0) {
+      logger.info(`Progress: ${this.processedCount}/${this.totalFiles} files processed (${this.successCount} success, ${this.failureCount} failed)`);
+      this.lastReported = this.processedCount;
+    }
+  }
+
+  getResults() {
+    return {
+      totalFiles: this.totalFiles,
+      successCount: this.successCount,
+      failureCount: this.failureCount
+    };
+  }
+}
+
 // Process files concurrently using worker pool
 async function processFilesConcurrently(files) {
   const workers = [];
-  const results = {
-    totalFiles: files.length,
-    successCount: 0,
-    failureCount: 0
-  };
+  const progressTracker = new ProgressTracker(files.length);
 
   try {
     // Create worker pool
@@ -298,40 +330,41 @@ async function processFilesConcurrently(files) {
     logger.info(`Processing ${files.length} files in ${batches.length} batches using ${workers.length} workers...`);
 
     // Process batches concurrently
-    let processedCount = 0;
     const workerPromises = batches.map(async (batch, batchIndex) => {
       const worker = workers[batchIndex % workers.length];
+      const batchResults = { success: 0, failure: 0 };
 
       for (const filePath of batch) {
         try {
-          logger.info(`Worker ${worker.workerId}: Processing ${processedCount + 1}/${files.length} - ${filePath}`);
+          logger.info(`Worker ${worker.workerId}: Processing ${filePath}`);
 
           const success = await worker.processFile(filePath);
 
           if (success) {
-            results.successCount++;
+            batchResults.success++;
           } else {
-            results.failureCount++;
+            batchResults.failure++;
           }
 
-          processedCount++;
-
-          if (processedCount % 10 === 0) {
-            logger.info(`Progress: ${processedCount}/${files.length} files processed (${results.successCount} success, ${results.failureCount} failed)`);
-          }
+          // Record progress in thread-safe way
+          progressTracker.recordResult(success);
 
         } catch (err) {
           logger.error(`Worker ${worker.workerId}: Failed to process ${filePath} - ${err.message}`);
-          results.failureCount++;
-          processedCount++;
+          batchResults.failure++;
+          progressTracker.recordResult(false);
         }
       }
+
+      logger.info(`Worker ${worker.workerId}: Batch completed - ${batchResults.success} success, ${batchResults.failure} failed`);
+      return batchResults;
     });
 
     // Wait for all workers to complete
-    await Promise.all(workerPromises);
+    const batchResults = await Promise.all(workerPromises);
 
-    logger.info(`All workers completed. Total: ${results.totalFiles}, Success: ${results.successCount}, Failed: ${results.failureCount}`);
+    const finalResults = progressTracker.getResults();
+    logger.info(`All workers completed. Total: ${finalResults.totalFiles}, Success: ${finalResults.successCount}, Failed: ${finalResults.failureCount}`);
 
   } finally {
     // Disconnect all workers
@@ -339,7 +372,7 @@ async function processFilesConcurrently(files) {
     await Promise.all(workers.map(worker => worker.disconnect()));
   }
 
-  return results;
+  return progressTracker.getResults();
 }
 
 // Upload .eml file
