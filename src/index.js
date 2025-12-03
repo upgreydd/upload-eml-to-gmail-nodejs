@@ -10,7 +10,7 @@ const xoauth2 = require("xoauth2");
 const { config } = require("./config");
 
 // Configuration for concurrent processing
-const WORKER_POOL_SIZE = process.env.WORKER_POOL_SIZE || 2; // Number of concurrent IMAP connections (reduced for Gmail stability)
+const WORKER_POOL_SIZE = process.env.WORKER_POOL_SIZE || 1; // Number of concurrent IMAP connections (reduced to prevent Gmail limits)
 const BATCH_SIZE = process.env.BATCH_SIZE || 3; // Files per worker batch (reduced for memory efficiency)
 
 // Global file lock to prevent duplicate processing
@@ -144,14 +144,12 @@ async function refreshOAuth2Token() {
   });
 }
 
-// Check if token needs refresh (called before operations)
-async function ensureValidToken(worker) {
+// Check if token needs refresh (called once per chunk, not per file)
+async function ensureValidTokenForChunk() {
   if (config.xoauth2 && config.xoauth2.clientId && Date.now() - lastTokenRefresh > TOKEN_REFRESH_INTERVAL) {
     try {
       const newToken = await refreshOAuth2Token();
-      // Reconnect worker with new token
-      await worker.disconnect();
-      await worker.connect();
+      logger.info("Token refreshed proactively for chunk processing");
       return true;
     } catch (err) {
       logger.error(`Token refresh failed: ${err.message}`);
@@ -318,21 +316,33 @@ class EmailWorker {
     this.isConnected = false;
   }
 
-  async connect() {
+  async connect(retryCount = 0) {
+    const maxRetries = 3;
+    const baseDelay = 5000; // 5 seconds base delay
+
     try {
-      logger.info(`Worker ${this.workerId}: Connecting to IMAP...`);
+      logger.info(`Worker ${this.workerId}: Connecting to IMAP... (attempt ${retryCount + 1}/${maxRetries + 1})`);
       this.imapClient = await connectToImap();
       this.isConnected = true;
 
-      // Start keep-alive for this worker
+      // Start keep-alive for this worker (reduced frequency to avoid connection issues)
       this.keepAlive = setInterval(() => {
         if (this.imapClient && this.isConnected) {
           this.imapClient.search(["ALL"], () => { });
         }
-      }, 45000); // Every 45 seconds
+      }, 120000); // Every 2 minutes (reduced from 45 seconds)
 
       logger.info(`Worker ${this.workerId}: Connected successfully`);
     } catch (err) {
+      this.isConnected = false;
+
+      if (err.message.includes('Too many simultaneous connections') && retryCount < maxRetries) {
+        const delay = baseDelay * Math.pow(2, retryCount); // Exponential backoff: 5s, 10s, 20s
+        logger.warn(`Worker ${this.workerId}: Gmail connection limit reached, retrying in ${delay / 1000}s... (attempt ${retryCount + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return this.connect(retryCount + 1);
+      }
+
       logger.error(`Worker ${this.workerId}: Connection failed - ${err.message}`);
       throw err;
     }
@@ -341,12 +351,6 @@ class EmailWorker {
   async processFile(filePath) {
     if (!this.isConnected || !this.imapClient) {
       throw new Error(`Worker ${this.workerId}: Not connected to IMAP`);
-    }
-
-    // Ensure OAuth2 token is valid before processing
-    const tokenValid = await ensureValidToken(this);
-    if (!tokenValid) {
-      throw new Error(`Worker ${this.workerId}: Failed to refresh OAuth2 token`);
     }
 
     // Check if file is already being processed by another worker
