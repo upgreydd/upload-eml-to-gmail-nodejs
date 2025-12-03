@@ -16,6 +16,11 @@ const BATCH_SIZE = process.env.BATCH_SIZE || 3; // Files per worker batch (reduc
 // Global file lock to prevent duplicate processing
 const processingFiles = new Set();
 
+// Track duplicate check failures to disable if unreliable
+let duplicateCheckFailures = 0;
+const MAX_DUPLICATE_CHECK_FAILURES = 10;
+let skipDuplicateChecks = false;
+
 // Set up logging
 const logger = winston.createLogger({
   exitOnError: false,
@@ -83,12 +88,12 @@ function connectToImap() {
 function createImapConnection(imapConfig, resolve, reject, isRetry = false) {
   const imapClient = new imap(imapConfig);
   imapClient.once("ready", () => {
-    imapClient.openBox(config.gmailLabel, false, (err) => {
+    imapClient.openBox(config.gmailLabel, false, (err, box) => {
       if (err) {
-        logger.error(`Failed to open mailbox: ${err.message}`);
+        logger.error(`Failed to open mailbox "${config.gmailLabel}": ${err.message}`);
         return reject(err);
       }
-      logger.info("Connected to IMAP server");
+      logger.info(`Connected to IMAP server - opened mailbox "${config.gmailLabel}" with ${box.messages.total} messages`);
       resolve(imapClient);
     });
   });
@@ -242,21 +247,31 @@ async function appendProcessedFile(filename) {
   }
 }
 
-// Check if email already exists in Gmail
+// Check if email already exists in Gmail (with proper error handling)
 async function isEmailAlreadyImported(imapClient, messageId, subject, date) {
   return new Promise((resolve, reject) => {
+    // Validate connection state first
+    if (!imapClient || imapClient.state !== 'authenticated') {
+      logger.warn(`IMAP client not in authenticated state (state: ${imapClient ? imapClient.state : 'null'})`);
+      return resolve(false);
+    }
+
     if (!messageId && !subject) {
       return resolve(false); // Can't check without identifiers
     }
 
+    // Build search criteria - use Gmail-specific syntax
     let searchCriteria = [];
 
     if (messageId) {
-      // Search by Message-ID header (most reliable)
-      searchCriteria = [['HEADER', 'MESSAGE-ID', messageId]];
+      // Clean up Message-ID (remove brackets if present for Gmail compatibility)
+      const cleanMessageId = messageId.replace(/^<|>$/g, '');
+      logger.debug(`Searching for Message-ID: ${cleanMessageId}`);
+      searchCriteria = [['HEADER', 'MESSAGE-ID', cleanMessageId]];
     } else if (subject && date) {
       // Fallback: search by subject and date
-      const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD format
+      const dateStr = date.toDateString(); // Use more compatible date format
+      logger.debug(`Searching for subject: "${subject}" on date: ${dateStr}`);
       searchCriteria = [
         ['HEADER', 'SUBJECT', subject],
         ['ON', dateStr]
@@ -265,22 +280,36 @@ async function isEmailAlreadyImported(imapClient, messageId, subject, date) {
       return resolve(false);
     }
 
-    imapClient.search(searchCriteria, (err, results) => {
-      if (err) {
-        logger.warn(`Error searching for duplicate: ${err.message}`);
-        return resolve(false); // Continue with upload on search error
-      }
+    // Add timeout handler at IMAP level with more detailed logging
+    const timeout = setTimeout(() => {
+      logger.warn(`IMAP search timeout after 30s for criteria: ${JSON.stringify(searchCriteria)}`);
+      resolve(false);
+    }, 30000);
 
-      const exists = results && results.length > 0;
-      if (exists) {
-        logger.info(`Email already exists (found ${results.length} match(es))`);
-      }
-      resolve(exists);
-    });
+    try {
+      imapClient.search(searchCriteria, (err, results) => {
+        clearTimeout(timeout);
+
+        if (err) {
+          logger.warn(`IMAP search error: ${err.message} (criteria: ${JSON.stringify(searchCriteria)})`);
+          return resolve(false); // Continue with upload on search error
+        }
+
+        const exists = results && results.length > 0;
+        if (exists) {
+          logger.info(`Email already exists (found ${results.length} match(es) for Message-ID: ${messageId})`);
+        } else {
+          logger.debug(`No duplicate found for Message-ID: ${messageId}`);
+        }
+        resolve(exists);
+      });
+    } catch (syncErr) {
+      clearTimeout(timeout);
+      logger.warn(`IMAP search exception: ${syncErr.message}`);
+      resolve(false);
+    }
   });
-}
-
-// Worker class for handling concurrent uploads
+}// Worker class for handling concurrent uploads
 class EmailWorker {
   constructor(workerId) {
     this.workerId = workerId;
@@ -527,21 +556,45 @@ async function uploadEml(imapClient, emlPath, filename) {
     const dateStr = parsed.headers.get("date");
     const date = new Date(dateStr);
 
-    // Check for duplicates in Gmail with timeout
-    logger.debug(`Checking Gmail for duplicates of ${filename}...`);
-    const messageId = parsed.headers.get("message-id");
-    const subject = parsed.subject;
+    // Check for duplicates in Gmail with timeout (with fallback mechanism)
+    let alreadyExists = false;
 
-    const alreadyExists = await withTimeout(
-      isEmailAlreadyImported(imapClient, messageId, subject, date),
-      120000, // 2 minute timeout for duplicate check
-      `Duplicate check for ${filename}`
-    );
+    if (!skipDuplicateChecks) {
+      try {
+        // Validate IMAP connection state before duplicate check
+        if (!imapClient || imapClient.state !== 'authenticated') {
+          throw new Error(`IMAP connection not ready (state: ${imapClient ? imapClient.state : 'null'})`);
+        }
 
-    if (alreadyExists) {
-      logger.debug(`Email ${filename} already exists in Gmail, skipping upload`);
-      await appendProcessedFile(filename);
-      return true; // Mark as successful since it's already there
+        logger.debug(`Checking Gmail for duplicates of ${filename}...`);
+        const messageId = parsed.headers.get("message-id");
+        const subject = parsed.subject;
+
+        logger.debug(`Message-ID: ${messageId}, Subject: ${subject ? subject.substring(0, 50) + '...' : 'none'}`);
+
+        alreadyExists = await withTimeout(
+          isEmailAlreadyImported(imapClient, messageId, subject, date),
+          45000, // 45 second timeout for duplicate check (reduced)
+          `Duplicate check for ${filename}`
+        );
+
+        if (alreadyExists) {
+          logger.debug(`Email ${filename} already exists in Gmail, skipping upload`);
+          await appendProcessedFile(filename);
+          return true; // Mark as successful since it's already there
+        }
+      } catch (err) {
+        duplicateCheckFailures++;
+        logger.warn(`Duplicate check failed for ${filename}: ${err.message} (failure ${duplicateCheckFailures}/${MAX_DUPLICATE_CHECK_FAILURES})`);
+
+        if (duplicateCheckFailures >= MAX_DUPLICATE_CHECK_FAILURES) {
+          skipDuplicateChecks = true;
+          logger.warn(`Too many duplicate check failures (${duplicateCheckFailures}). Disabling duplicate checks for performance.`);
+        }
+        // Continue with upload if duplicate check fails
+      }
+    } else {
+      logger.debug(`Skipping duplicate check for ${filename} (disabled due to previous failures)`);
     }
 
     // Upload to Gmail with timeout
