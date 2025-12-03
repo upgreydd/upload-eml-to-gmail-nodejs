@@ -643,6 +643,99 @@ async function uploadEml(imapClient, emlPath, filename) {
   }
 }
 
+// Process files sequentially (one by one) for maximum stability
+async function processFilesSequentially(files) {
+  logger.info(`Processing ${files.length} files sequentially (one by one) for maximum stability...`);
+
+  let imapClient = null;
+  let successCount = 0;
+  let failureCount = 0;
+
+  try {
+    // Create single IMAP connection
+    logger.info("Connecting to IMAP...");
+    imapClient = await connectToImap();
+    logger.info("Single IMAP connection established successfully");
+
+    // Process files one by one
+    for (let i = 0; i < files.length; i++) {
+      const filePath = files[i];
+      const progress = `${i + 1}/${files.length}`;
+
+      try {
+        // Check connection state before each file
+        if (!imapClient || imapClient.state !== 'authenticated') {
+          logger.warn(`IMAP connection lost (state: ${imapClient ? imapClient.state : 'null'}), reconnecting...`);
+          if (imapClient) {
+            try { imapClient.end(); } catch (e) { /* ignore */ }
+          }
+          imapClient = await connectToImap();
+          logger.info("IMAP connection reestablished");
+        }
+
+        logger.debug(`[${progress}] Processing: ${filePath}`);
+
+        const emlPath = path.join(config.emlDir, filePath);
+        const success = await uploadEml(imapClient, emlPath, filePath);
+
+        if (success) {
+          successCount++;
+          logger.debug(`[${progress}] ✓ Success: ${filePath}`);
+        } else {
+          failureCount++;
+          logger.warn(`[${progress}] ✗ Failed: ${filePath}`);
+        }
+
+        // Progress reporting every 10 files
+        if ((i + 1) % 10 === 0 || (i + 1) === files.length) {
+          logger.info(`📊 Progress: ${i + 1}/${files.length} files processed (${successCount} success, ${failureCount} failed)`);
+        }
+
+        // Small delay between files to avoid overwhelming Gmail
+        if (i < files.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 2000)); // 2 second delay
+        }
+
+      } catch (err) {
+        failureCount++;
+        logger.error(`[${progress}] ✗ Failed to process ${filePath}: ${err.message}`);
+
+        // If connection error, try to reconnect for next file
+        if (err.message.includes('connection') || err.message.includes('IMAP') || err.message.includes('authenticated')) {
+          logger.warn("Connection-related error detected, will reconnect for next file");
+          if (imapClient) {
+            try { imapClient.end(); } catch (e) { /* ignore */ }
+            imapClient = null;
+          }
+        }
+      }
+    }
+
+    const results = {
+      totalFiles: files.length,
+      successCount: successCount,
+      failureCount: failureCount
+    };
+
+    logger.info(`Sequential processing completed. Total: ${results.totalFiles}, Success: ${results.successCount}, Failed: ${results.failureCount}`);
+    return results;
+
+  } catch (err) {
+    logger.error(`Fatal error in sequential processing: ${err.message}`);
+    throw err;
+  } finally {
+    // Clean up single connection
+    if (imapClient) {
+      try {
+        logger.info("Disconnecting IMAP connection...");
+        imapClient.end();
+      } catch (err) {
+        logger.error(`Error disconnecting IMAP: ${err.message}`);
+      }
+    }
+  }
+}
+
 // Process files in chunks to avoid memory overload
 async function processFilesInChunks(processedFiles, allEmlFiles) {
   const CHUNK_SIZE = 100; // Process 100 files at a time
@@ -663,8 +756,8 @@ async function processFilesInChunks(processedFiles, allEmlFiles) {
 
     logger.info(`Processing chunk ${Math.floor(i / CHUNK_SIZE) + 1}: ${unprocessedChunk.length} files (${i + 1} to ${Math.min(i + CHUNK_SIZE, allEmlFiles.length)} of ${allEmlFiles.length})`);
 
-    // Process this chunk
-    const chunkResults = await processFilesConcurrently(unprocessedChunk);
+    // Process this chunk sequentially
+    const chunkResults = await processFilesSequentially(unprocessedChunk);
 
     totalProcessed += chunkResults.totalFiles;
     totalSuccess += chunkResults.successCount;
