@@ -112,6 +112,50 @@ function createImapConnection(imapConfig, resolve, reject, isRetry = false) {
   imapClient.connect();
 }
 
+// Global token refresh tracking
+let lastTokenRefresh = 0;
+const TOKEN_REFRESH_INTERVAL = 45 * 60 * 1000; // Refresh every 45 minutes
+
+// Proactive OAuth2 token refresh
+async function refreshOAuth2Token() {
+  return new Promise((resolve, reject) => {
+    const xoauth2gen = xoauth2.createXOAuth2Generator({
+      user: config.imap.user,
+      clientId: config.xoauth2.clientId,
+      clientSecret: config.xoauth2.clientSecret,
+      refreshToken: config.xoauth2.refreshToken
+    });
+
+    xoauth2gen.getToken((err, token) => {
+      if (err) {
+        logger.error(`Failed to refresh OAuth2 token: ${err.message}`);
+        return reject(err);
+      }
+
+      lastTokenRefresh = Date.now();
+      logger.info("OAuth2 token refreshed proactively");
+      resolve(token);
+    });
+  });
+}
+
+// Check if token needs refresh (called before operations)
+async function ensureValidToken(worker) {
+  if (config.xoauth2 && config.xoauth2.clientId && Date.now() - lastTokenRefresh > TOKEN_REFRESH_INTERVAL) {
+    try {
+      const newToken = await refreshOAuth2Token();
+      // Reconnect worker with new token
+      await worker.disconnect();
+      await worker.connect();
+      return true;
+    } catch (err) {
+      logger.error(`Token refresh failed: ${err.message}`);
+      return false;
+    }
+  }
+  return true;
+}
+
 // Refresh OAuth2 token and retry connection
 function refreshTokenAndRetry(originalConfig, resolve, reject) {
   const xoauth2gen = xoauth2.createXOAuth2Generator({
@@ -268,6 +312,12 @@ class EmailWorker {
   async processFile(filePath) {
     if (!this.isConnected || !this.imapClient) {
       throw new Error(`Worker ${this.workerId}: Not connected to IMAP`);
+    }
+
+    // Ensure OAuth2 token is valid before processing
+    const tokenValid = await ensureValidToken(this);
+    if (!tokenValid) {
+      throw new Error(`Worker ${this.workerId}: Failed to refresh OAuth2 token`);
     }
 
     // Check if file is already being processed by another worker
@@ -469,13 +519,6 @@ function withTimeout(promise, timeoutMs, operation) {
 // Upload .eml file
 async function uploadEml(imapClient, emlPath, filename) {
   try {
-    // Double-check processed files first (fastest check)
-    const currentProcessedFiles = await getProcessedFiles();
-    if (currentProcessedFiles.has(filename)) {
-      logger.debug(`File ${filename} already in processed list, skipping`);
-      return true;
-    }
-
     // Read and parse .eml file
     const emlContent = await fs.readFile(emlPath);
     const parsed = await simpleParser(emlContent);
