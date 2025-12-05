@@ -49,22 +49,9 @@ function connectToImap() {
       if (config.xoauth2 && config.xoauth2.clientId && config.xoauth2.clientSecret && config.xoauth2.refreshToken) {
         logger.info("Using xoauth2 authentication");
 
-        // Create xoauth2 generator
-        const xoauth2gen = xoauth2.createXOAuth2Generator({
-          user: config.imap.user,
-          clientId: config.xoauth2.clientId,
-          clientSecret: config.xoauth2.clientSecret,
-          refreshToken: config.xoauth2.refreshToken,
-          accessToken: config.xoauth2.accessToken || undefined
-        });
-
-        // Get token
-        xoauth2gen.getToken((err, token) => {
-          if (err) {
-            logger.error(`Failed to get xoauth2 token: ${err.message}`);
-            logger.error('Make sure your OAuth2 credentials are correct. See XOAUTH2_SETUP.md for help.');
-            return reject(err);
-          }
+        try {
+          // Get valid token (cached or refreshed)
+          const token = await getValidOAuth2Token();
 
           // Configure IMAP with xoauth2
           imapConfig.xoauth2 = token;
@@ -72,7 +59,11 @@ function connectToImap() {
 
           logger.info("xoauth2 token obtained successfully");
           createImapConnection(imapConfig, resolve, reject);
-        });
+        } catch (err) {
+          logger.error(`Failed to get xoauth2 token: ${err.message}`);
+          logger.error('Make sure your OAuth2 credentials are correct. See XOAUTH2_SETUP.md for help.');
+          return reject(err);
+        }
       } else {
         logger.info("Using password authentication");
         createImapConnection(imapConfig, resolve, reject);
@@ -117,9 +108,40 @@ function createImapConnection(imapConfig, resolve, reject, isRetry = false) {
   imapClient.connect();
 }
 
-// Global token refresh tracking
+// Global OAuth2 token management
+let globalOAuth2Token = null;
 let lastTokenRefresh = 0;
 const TOKEN_REFRESH_INTERVAL = 45 * 60 * 1000; // Refresh every 45 minutes
+let tokenRefreshPromise = null; // Prevent concurrent refreshes
+
+// Get or refresh OAuth2 token with caching
+async function getValidOAuth2Token(forceRefresh = false) {
+  // If a refresh is already in progress, wait for it
+  if (tokenRefreshPromise) {
+    logger.info("Token refresh already in progress, waiting...");
+    return await tokenRefreshPromise;
+  }
+
+  // Check if we need to refresh
+  const needsRefresh = forceRefresh ||
+    !globalOAuth2Token ||
+    (Date.now() - lastTokenRefresh > TOKEN_REFRESH_INTERVAL);
+
+  if (!needsRefresh) {
+    return globalOAuth2Token;
+  }
+
+  // Start token refresh
+  tokenRefreshPromise = refreshOAuth2Token();
+
+  try {
+    const token = await tokenRefreshPromise;
+    globalOAuth2Token = token;
+    return token;
+  } finally {
+    tokenRefreshPromise = null;
+  }
+}
 
 // Proactive OAuth2 token refresh
 async function refreshOAuth2Token() {
@@ -138,21 +160,21 @@ async function refreshOAuth2Token() {
       }
 
       lastTokenRefresh = Date.now();
-      logger.info("OAuth2 token refreshed proactively");
+      logger.info("OAuth2 token refreshed successfully");
       resolve(token);
     });
   });
 }
 
-// Check if token needs refresh (called once per chunk, not per file)
+// Ensure token is valid for chunk processing
 async function ensureValidTokenForChunk() {
-  if (config.xoauth2 && config.xoauth2.clientId && Date.now() - lastTokenRefresh > TOKEN_REFRESH_INTERVAL) {
+  if (config.xoauth2 && config.xoauth2.clientId) {
     try {
-      const newToken = await refreshOAuth2Token();
-      logger.info("Token refreshed proactively for chunk processing");
+      await getValidOAuth2Token(); // This will refresh if needed
+      logger.info("OAuth2 token validated for chunk processing");
       return true;
     } catch (err) {
-      logger.error(`Token refresh failed: ${err.message}`);
+      logger.error(`Token validation failed: ${err.message}`);
       return false;
     }
   }
@@ -160,24 +182,18 @@ async function ensureValidTokenForChunk() {
 }
 
 // Refresh OAuth2 token and retry connection
-function refreshTokenAndRetry(originalConfig, resolve, reject) {
-  const xoauth2gen = xoauth2.createXOAuth2Generator({
-    user: config.imap.user,
-    clientId: config.xoauth2.clientId,
-    clientSecret: config.xoauth2.clientSecret,
-    refreshToken: config.xoauth2.refreshToken
-  });
-
-  xoauth2gen.getToken((err, token) => {
-    if (err) {
-      logger.error(`Failed to refresh OAuth2 token: ${err.message}`);
-      return reject(err);
-    }
+async function refreshTokenAndRetry(originalConfig, resolve, reject) {
+  try {
+    logger.info("Authentication failed, attempting to refresh OAuth2 token...");
+    const token = await getValidOAuth2Token(true); // Force refresh
 
     logger.info("OAuth2 token refreshed successfully, retrying connection...");
     const newConfig = { ...originalConfig, xoauth2: token };
     createImapConnection(newConfig, resolve, reject, true); // Mark as retry
-  });
+  } catch (err) {
+    logger.error(`Failed to refresh OAuth2 token: ${err.message}`);
+    reject(err);
+  }
 }
 
 // Recursively get all files from directory and subdirectories
@@ -669,8 +685,18 @@ async function processFilesSequentially(files) {
           if (imapClient) {
             try { imapClient.end(); } catch (e) { /* ignore */ }
           }
-          imapClient = await connectToImap();
-          logger.info("IMAP connection reestablished");
+
+          // Ensure we have a fresh token before reconnecting
+          try {
+            await getValidOAuth2Token();
+            imapClient = await connectToImap();
+            logger.info("IMAP connection reestablished");
+          } catch (connErr) {
+            logger.error(`Failed to reestablish connection: ${connErr.message}`);
+            // If connection fails, we'll try again on next file
+            imapClient = null;
+            throw connErr;
+          }
         }
 
         logger.debug(`[${progress}] Processing: ${filePath}`);
@@ -700,12 +726,23 @@ async function processFilesSequentially(files) {
         failureCount++;
         logger.error(`[${progress}] ✗ Failed to process ${filePath}: ${err.message}`);
 
-        // If connection error, try to reconnect for next file
-        if (err.message.includes('connection') || err.message.includes('IMAP') || err.message.includes('authenticated')) {
-          logger.warn("Connection-related error detected, will reconnect for next file");
+        // If connection error or auth error, force token refresh and reconnect
+        if (err.message.includes('connection') ||
+          err.message.includes('IMAP') ||
+          err.message.includes('authenticated') ||
+          err.message.includes('Invalid credentials') ||
+          err.message.includes('Authentication failed')) {
+          logger.warn("Connection or authentication error detected, forcing token refresh for next file");
           if (imapClient) {
             try { imapClient.end(); } catch (e) { /* ignore */ }
             imapClient = null;
+          }
+          // Force token refresh for next connection attempt
+          try {
+            await getValidOAuth2Token(true);
+            logger.info("Token refreshed due to authentication error");
+          } catch (tokenErr) {
+            logger.error(`Failed to refresh token: ${tokenErr.message}`);
           }
         }
       }
@@ -756,6 +793,12 @@ async function processFilesInChunks(processedFiles, allEmlFiles) {
 
     logger.info(`Processing chunk ${Math.floor(i / CHUNK_SIZE) + 1}: ${unprocessedChunk.length} files (${i + 1} to ${Math.min(i + CHUNK_SIZE, allEmlFiles.length)} of ${allEmlFiles.length})`);
 
+    // Ensure valid OAuth2 token before processing chunk
+    if (!(await ensureValidTokenForChunk())) {
+      logger.error("Failed to ensure valid token for chunk, skipping chunk");
+      continue;
+    }
+
     // Process this chunk sequentially
     const chunkResults = await processFilesSequentially(unprocessedChunk);
 
@@ -785,6 +828,18 @@ async function main() {
   let failureCount = 0;
 
   try {
+    // Ensure we start with a fresh OAuth2 token
+    if (config.xoauth2 && config.xoauth2.clientId) {
+      logger.info("Refreshing OAuth2 token at startup...");
+      try {
+        await getValidOAuth2Token(true); // Force refresh at startup
+        logger.info("Startup token refresh completed successfully");
+      } catch (err) {
+        logger.error(`Failed to refresh token at startup: ${err.message}`);
+        throw err;
+      }
+    }
+
     // Load processed files
     logger.info("Reading processed files...");
     const processedFiles = await getProcessedFiles();
